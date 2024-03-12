@@ -1,16 +1,6 @@
 # SPIRE Keylime Plugin
 
-This repository contains an experimental agent and server plugins for [SPIRE](https://github.com/spiffe/spire) to allow Keylime node attestation.
-
-## Menu
-
-- [Quick start](#quick-start)
-- [How it Works](#how-it-works)
-- [Building](#building)
-- [Contributions](#contributions)
-- [License](#license)
-- [Code of Conduct](#code-of-conduct)
-- [Security Vulnerability Reporting](#security-vulnerability-reporting)
+This repository contains experimental agent and server plugins for [SPIRE](https://github.com/spiffe/spire) to allow Keylime node attestation.
 
 ## Quick Start
 
@@ -20,12 +10,12 @@ Before starting, create a running SPIRE deployment and add the following configu
 
 ```hcl
 NodeAttestor "keylime" {
-	plugin_cmd = "/path/to/plugin_cmd"
-	plugin_checksum = "sha256 of the plugin binary"
-	plugin_data {
+    plugin_cmd = "/path/to/plugin_cmd"
+    plugin_checksum = "sha256 of the plugin binary"
+    plugin_data {
         keylime_agent_host = "192.168.0.52"
         keylime_agent_port = "9005"
-	}
+    }
 }
 ```
 
@@ -38,12 +28,12 @@ NodeAttestor "keylime" {
 
 ```hcl
 NodeAttestor "keylime" {
-	plugin_cmd = "/path/to/plugin_cmd"
-	plugin_checksum = "sha256 of the plugin binary"
-	plugin_data {
+    plugin_cmd = "/path/to/plugin_cmd"
+    plugin_checksum = "sha256 of the plugin binary"
+    plugin_data {
         keylime_verifier_host = "192.168.0.53"
         keylime_verifier_port = "8888"
-	}
+    }
 }
 ```
 
