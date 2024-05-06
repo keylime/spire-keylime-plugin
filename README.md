@@ -41,6 +41,10 @@ NodeAttestor "keylime" {
 |:----|:-----|:---------|:------------|:--------|
 | keylime_verifier_host | string | no | hostname of the verifier server | 127.0.0.1 |
 | keylime_verifier_port | string | no | port number of the verifier server | 8881 |
+| keylime_tls_ca_cert_file | string | no | The TLS certificate file for the CA that covers the Keylime servers | /var/lib/keylime/cv_ca/cacert.crt |
+| keylime_tls_cert_file | string | no | The TLS certificate file for the Keylime verifier server | /var/lib/keylime/cv_ca/server-cert.crt |
+| keylime_tls_key_file | string | no | The TLS key file for the TLS cert in keylime_tls_cert_file | /var/lib/keylime/cv_ca/server-private.pem |
+
 
 ## How it Works
 
@@ -61,6 +65,11 @@ For more info on how Keylime attestation works see [keylime.dev](keylime.dev).
 ## Supported Selectors
 
 TBD: Selector support is coming soon
+
+## Supported Versions
+
+This plugin requires the Keylime server >=7.10.1 and Keylime agent >=0.2.6 (needs at least version 2.2 of the Keylime API).
+For SPIRE, this plugin was developed against the SPIRE SDK version 1.8.2.
 
 ## Building
 

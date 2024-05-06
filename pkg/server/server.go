@@ -34,11 +34,12 @@ var (
 )
 
 type Config struct {
-	KeylimeVerifierHost string `hcl:"keylime_verifier_host"`
-	KeylimeVerifierPort string `hcl:"keylime_verifier_port"`
-	KeylimeTlsCertFile  string `hcl:"keylime_tls_cert_file"`
-	KeylimeTlsKeyFile   string `hcl:"keylime_tls_key_file"`
-	trustDomain         spiffeid.TrustDomain
+	KeylimeVerifierHost  string `hcl:"keylime_verifier_host"`
+	KeylimeVerifierPort  string `hcl:"keylime_verifier_port"`
+	KeylimeTlsCACertFile string `hcl:"keylime_tls_ca_cert_file"`
+	KeylimeTlsCertFile   string `hcl:"keylime_tls_cert_file"`
+	KeylimeTlsKeyFile    string `hcl:"keylime_tls_key_file"`
+	trustDomain          spiffeid.TrustDomain
 }
 
 type Plugin struct {
@@ -93,7 +94,7 @@ func (p *Plugin) Attest(stream nodeattestorv1.NodeAttestor_AttestServer) error {
 	hashAlg := string(keylimeAgentData.HashAlg)
 
 	// Create an HTTP client that can speak TLS with the Keylime verifier
-	keylimeCACert, err := ioutil.ReadFile(conf.KeylimeTlsCertFile)
+	keylimeCACert, err := ioutil.ReadFile(conf.KeylimeTlsCACertFile)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -302,6 +303,10 @@ func validatePluginConfig(c *Config) error {
 		c.KeylimeVerifierPort = "8881"
 	}
 
+	if c.KeylimeTlsCACertFile == "" {
+		c.KeylimeTlsCACertFile = "/var/lib/keylime/cv_ca/cacert.crt"
+	}
+
 	if c.KeylimeTlsCertFile == "" {
 		c.KeylimeTlsCertFile = "/var/lib/keylime/cv_ca/server-cert.crt"
 	}
@@ -323,11 +328,11 @@ func validatePluginConfig(c *Config) error {
 	}
 
 	// validate that the key and cert files exists
-	if _, err := os.Stat(c.KeylimeMtlsCertFile); err != nil {
-		return errors.New("mtls_cert_file does not exist")
+	if _, err := os.Stat(c.KeylimeTlsCertFile); err != nil {
+		return errors.New("keylime_tls_cert_file does not exist")
 	}
-	if _, err := os.Stat(c.KeylimeMtlsKeyFile); err != nil {
-		return errors.New("mtls_key_file does not exist")
+	if _, err := os.Stat(c.KeylimeTlsKeyFile); err != nil {
+		return errors.New("keylime_tls_key_file does not exist")
 	}
 
 	return nil
