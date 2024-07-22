@@ -211,7 +211,7 @@ func (p *Plugin) AidAttestation(stream nodeattestorv1.NodeAttestor_AidAttestatio
 		st := status.Convert(err)
 		return status.Errorf(st.Code(), "unable to send challenge response: %s", st.Message())
 	}
-	p.log.Debug("Challenge response sent")
+	p.log.Info("Keylime Attestation response sent")
 
 	return nil
 }
