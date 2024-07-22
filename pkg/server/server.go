@@ -210,6 +210,8 @@ func (p *Plugin) Attest(stream nodeattestorv1.NodeAttestor_AttestServer) error {
 
 	if keylimeIdentityValid != 1 {
 		return status.Errorf(codes.Internal, "Keylime agent did not pass identity check")
+	} else {
+		p.log.Info("Keylime Attestation Successful")
 	}
 
 	// Create SPIFFE ID and selectors
