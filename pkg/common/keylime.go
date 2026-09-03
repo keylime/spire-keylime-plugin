@@ -6,7 +6,7 @@ import (
 )
 
 const PluginName = "keylime"
-const KeylimeAPIVersion = "v2.2"
+const KeylimeAPIVersion = "v2.5"
 
 // We use a 32 bytes nonce to provide enough cryptographical randomness and to be
 // consistent with other nonces sizes around the project.

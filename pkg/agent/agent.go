@@ -2,10 +2,13 @@ package keylime
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"strconv"
 	"sync"
 
@@ -27,8 +30,12 @@ var (
 )
 
 type Config struct {
-	KeylimeAgentHost string `hcl:"keylime_agent_host"`
-	KeylimeAgentPort string `hcl:"keylime_agent_port"`
+	KeylimeAgentHost      string `hcl:"keylime_agent_host"`
+	KeylimeAgentPort      string `hcl:"keylime_agent_port"`
+	KeylimeAgentUseTLS    bool   `hcl:"keylime_agent_use_tls"`
+	KeylimeAgentCACert    string `hcl:"keylime_agent_ca_cert"`
+	KeylimeAgentClientCert string `hcl:"keylime_agent_client_cert"`
+	KeylimeAgentClientKey  string `hcl:"keylime_agent_client_key"`
 }
 
 type Plugin struct {
@@ -38,6 +45,7 @@ type Plugin struct {
 
 	mtx  sync.RWMutex
 	conf *Config
+	httpClient *http.Client
 }
 
 type KeylimeAgentInfoResponse struct {
@@ -69,13 +77,19 @@ func (p *Plugin) Configure(ctx context.Context, req *configv1.ConfigureRequest) 
 		return nil, status.Errorf(codes.InvalidArgument, "failed to decode configuration: %v", err)
 	}
 
-	p.log.Debug("Loaded Config Vars", "KeylimeAgentPort", config.KeylimeAgentPort, "KeylimeAgentHost", config.KeylimeAgentHost)
+	p.log.Debug("Loaded Config Vars", "KeylimeAgentPort", config.KeylimeAgentPort, "KeylimeAgentHost", config.KeylimeAgentHost, "KeylimeAgentUseTLS", config.KeylimeAgentUseTLS)
 
 	if err := validatePluginConfig(config); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid configuration: %v", err)
 	}
 
-	p.setConfig(config)
+	// Create HTTP client with TLS configuration if enabled
+	httpClient, err := createHTTPClient(config, p.log)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "failed to create HTTP client: %v", err)
+	}
+
+	p.setConfig(config, httpClient)
 	return &configv1.ConfigureResponse{}, nil
 }
 
@@ -84,30 +98,37 @@ func (p *Plugin) SetLogger(log hclog.Logger) {
 }
 
 // getConfig gets the configuration under a read lock.
-func (p *Plugin) getConfig() (*Config, error) {
+func (p *Plugin) getConfig() (*Config, *http.Client, error) {
 	p.mtx.RLock()
 	defer p.mtx.RUnlock()
 	if p.conf == nil {
-		return nil, status.Error(codes.FailedPrecondition, "not configured")
+		return nil, nil, status.Error(codes.FailedPrecondition, "not configured")
 	}
-	return p.conf, nil
+	return p.conf, p.httpClient, nil
 }
 
 // setConfig replaces the configuration atomically under a write lock.
-func (p *Plugin) setConfig(config *Config) {
+func (p *Plugin) setConfig(config *Config, httpClient *http.Client) {
 	p.mtx.Lock()
 	p.conf = config
+	p.httpClient = httpClient
 	p.mtx.Unlock()
 }
 
 func (p *Plugin) AidAttestation(stream nodeattestorv1.NodeAttestor_AidAttestationServer) error {
-	conf, _ := p.getConfig()
+	conf, httpClient, _ := p.getConfig()
 	if conf == nil {
 		return status.Error(codes.FailedPrecondition, "not configured")
 	}
 
+	// Determine protocol based on TLS configuration
+	protocol := "http"
+	if conf.KeylimeAgentUseTLS {
+		protocol = "https"
+	}
+
 	// keylime agent URL
-	keylimeAgentUrl := fmt.Sprintf("http://%s:%s/%s", conf.KeylimeAgentHost, conf.KeylimeAgentPort, common_keylime.KeylimeAPIVersion)
+	keylimeAgentUrl := fmt.Sprintf("%s://%s:%s/%s", protocol, conf.KeylimeAgentHost, conf.KeylimeAgentPort, common_keylime.KeylimeAPIVersion)
 
 	// get keylime node information from keylime agent
 	keylimeInfoUrl := fmt.Sprintf("%s/agent/info", keylimeAgentUrl)
@@ -116,7 +137,7 @@ func (p *Plugin) AidAttestation(stream nodeattestorv1.NodeAttestor_AidAttestatio
 	if err != nil {
 		return status.Errorf(codes.Internal, "unable to create HTTP request to Keylime agent for %s: %s", keylimeInfoUrl, err)
 	}
-	infoRes, err := http.DefaultClient.Do(infoReq) // TODO - replace default client with configuration timeouts
+	infoRes, err := httpClient.Do(infoReq)
 	if err != nil {
 		return status.Errorf(codes.Internal, "unable to contact Keylime agent at %s: %s", keylimeInfoUrl, err)
 	}
@@ -178,7 +199,7 @@ func (p *Plugin) AidAttestation(stream nodeattestorv1.NodeAttestor_AidAttestatio
 	q.Add("nonce", string(nonce))
 	identityReq.URL.RawQuery = q.Encode()
 
-	identityRes, err := http.DefaultClient.Do(identityReq)
+	identityRes, err := httpClient.Do(identityReq)
 	if err != nil {
 		return status.Errorf(codes.Internal, "unable to contact Keylime agent at %s: %s", keylimeIdentityUrl, err)
 	}
@@ -216,6 +237,51 @@ func (p *Plugin) AidAttestation(stream nodeattestorv1.NodeAttestor_AidAttestatio
 	return nil
 }
 
+func createHTTPClient(config *Config, log hclog.Logger) (*http.Client, error) {
+	if !config.KeylimeAgentUseTLS {
+		log.Debug("TLS disabled, using default HTTP client")
+		return http.DefaultClient, nil
+	}
+
+	log.Debug("Configuring TLS for Keylime agent connection")
+
+	// Create TLS configuration
+	tlsConfig := &tls.Config{}
+
+	// Load CA certificate if provided
+	if config.KeylimeAgentCACert != "" {
+		caCert, err := os.ReadFile(config.KeylimeAgentCACert)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read CA certificate: %v", err)
+		}
+		caCertPool := x509.NewCertPool()
+		if !caCertPool.AppendCertsFromPEM(caCert) {
+			return nil, fmt.Errorf("failed to parse CA certificate")
+		}
+		tlsConfig.RootCAs = caCertPool
+		log.Debug("Loaded CA certificate", "path", config.KeylimeAgentCACert)
+	}
+
+	// Load client certificate and key if provided
+	if config.KeylimeAgentClientCert != "" && config.KeylimeAgentClientKey != "" {
+		clientCert, err := tls.LoadX509KeyPair(config.KeylimeAgentClientCert, config.KeylimeAgentClientKey)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load client certificate: %v", err)
+		}
+		tlsConfig.Certificates = []tls.Certificate{clientCert}
+		log.Debug("Loaded client certificate", "cert", config.KeylimeAgentClientCert, "key", config.KeylimeAgentClientKey)
+	}
+
+	// Create HTTP client with TLS configuration
+	transport := &http.Transport{
+		TLSClientConfig: tlsConfig,
+	}
+
+	return &http.Client{
+		Transport: transport,
+	}, nil
+}
+
 func validatePluginConfig(c *Config) error {
 	// validate host and port settings, or set to defaults if empty
 	if c.KeylimeAgentHost == "" {
@@ -236,6 +302,14 @@ func validatePluginConfig(c *Config) error {
 	}
 	if portNum > 65535 {
 		return errors.New("keylime_agent_port is too large to be a port")
+	}
+
+	// Validate TLS configuration
+	if c.KeylimeAgentUseTLS {
+		// Client cert and key must both be provided or both be empty
+		if (c.KeylimeAgentClientCert == "") != (c.KeylimeAgentClientKey == "") {
+			return errors.New("both keylime_agent_client_cert and keylime_agent_client_key must be provided together")
+		}
 	}
 
 	return nil

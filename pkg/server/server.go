@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,7 +13,9 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/hcl"
@@ -22,7 +25,6 @@ import (
 	"github.com/spiffe/spire-plugin-sdk/pluginsdk"
 	nodeattestorv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/plugin/server/nodeattestor/v1"
 	configv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/service/common/config/v1"
-	"github.com/spiffe/spire/pkg/common/idutil"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -67,6 +69,53 @@ type KeylimeVerifierValidateResponse struct {
 	} `json:"results"`
 }
 
+// pemWrapCert accepts either PEM or bare base64 DER and returns PEM.
+//
+// The keylime REGISTRAR stores mtls_cert as bare base64 DER; the VERIFIER stores and requires PEM.
+// Idempotent, so a registrar that ever starts returning PEM keeps working.
+func pemWrapCert(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	if strings.Contains(s, "-----BEGIN CERTIFICATE-----") {
+		return s
+	}
+	s = strings.Join(strings.Fields(s), "")
+	var b strings.Builder
+	b.WriteString("-----BEGIN CERTIFICATE-----\n")
+	for i := 0; i < len(s); i += 64 {
+		end := i + 64
+		if end > len(s) {
+			end = len(s)
+		}
+		b.WriteString(s[i:end])
+		b.WriteString("\n")
+	}
+	b.WriteString("-----END CERTIFICATE-----\n")
+	return b.String()
+}
+
+type KeylimeAgentAddRequest struct {
+	TpmPolicy               string `json:"tpm_policy"`
+	MetaData                string `json:"metadata"`
+	MbRefstate              string `json:"mb_refstate"`
+	MbPolicy                string `json:"mb_policy"`
+	ImaSignVerificationKeys string `json:"ima_sign_verification_keys"`
+	RuntimePolicy           string `json:"runtime_policy"`
+	RuntimePolicyName       string `json:"runtime_policy_name"`
+	MbPolicyName            string `json:"mb_policy_name"`
+	RevocationKey           string `json:"revocation_key"`
+	AcceptTpmHashAlgs       string `json:"accept_tpm_hash_algs"`
+	AcceptTpmEncryptionAlgs string `json:"accept_tpm_encryption_algs"`
+	AcceptTpmSigningAlgs    string `json:"accept_tpm_signing_algs"`
+	AkTpm                   string `json:"ak_tpm"`
+	MtlsCert                string `json:"mtls_cert"`
+	SupportedVersion        string `json:"supported_version"`
+	CloudAgentIP            string `json:"cloudagent_ip"`
+	CloudAgentPort          string `json:"cloudagent_port"`
+}
+
 func New() *Plugin {
 	return &Plugin{}
 }
@@ -109,9 +158,8 @@ func (p *Plugin) Attest(stream nodeattestorv1.NodeAttestor_AttestServer) error {
 	httpClient := &http.Client{
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{
-				RootCAs:            keylimeCACertPool,
-				Certificates:       []tls.Certificate{keylimeCert},
-				InsecureSkipVerify: true, // TODO - remove after development
+				RootCAs:      keylimeCACertPool,
+				Certificates: []tls.Certificate{keylimeCert},
 			},
 		},
 	}
@@ -130,6 +178,160 @@ func (p *Plugin) Attest(stream nodeattestorv1.NodeAttestor_AttestServer) error {
 		return status.Errorf(codes.Internal, "unable to contact Keylime verifier at %s: %s", keylimeStatusUrl, err)
 	}
 	p.log.Debug("Request results", "url", keylimeStatusUrl, "response", statusRes.StatusCode)
+
+	// If agent doesn't exist in verifier (404), add it
+	if statusRes.StatusCode == http.StatusNotFound {
+		p.log.Info("Agent not found in verifier, adding it", "agent_uuid", agentID)
+
+		// Get AK from registrar
+		registrarUrl := fmt.Sprintf("https://registrar.keylime.funlab.casa:8891/%s/agents/%s", common_keylime.KeylimeAPIVersion, agentID)
+		p.log.Debug("Fetching AK from registrar", "url", registrarUrl)
+		regReq, err := http.NewRequest(http.MethodGet, registrarUrl, nil)
+		if err != nil {
+			return status.Errorf(codes.Internal, "unable to create registrar request: %v", err)
+		}
+		regRes, err := httpClient.Do(regReq)
+		if err != nil {
+			return status.Errorf(codes.Internal, "unable to contact registrar: %v", err)
+		}
+		defer regRes.Body.Close()
+
+		var regResults struct {
+			Code    int `json:"code"`
+			Results struct {
+				AikTpm   string `json:"aik_tpm"`
+				IP       string `json:"ip"`
+				Port     int    `json:"port"`
+				MtlsCert string `json:"mtls_cert"`
+			} `json:"results"`
+		}
+		err = json.NewDecoder(regRes.Body).Decode(&regResults)
+		if err != nil {
+			return status.Errorf(codes.Internal, "unable to decode registrar response: %v", err)
+		}
+		akTpm := regResults.Results.AikTpm
+
+		// Agent mTLS certificate, from the REGISTRAR rather than a hardcoded file.
+		//
+		// This previously read /etc/spire/keylime/auth-agent-cert.pem and sent it for EVERY agent it
+		// registered. Measured 2026-09-02: that file is AUTH's certificate --
+		// CN=agent.keylime.auth.funlab.casa, SANs covering only 10.10.2.70 and 127.0.0.1 -- and it
+		// EXPIRED on Feb 21 2026. All seven agents in the verifier nonetheless carried it, because
+		// keylime never validates the stored certificate's expiry; it only has to PARSE. The fleet's
+		// verifier-to-agent mTLS therefore ran entirely on an expired certificate issued to a single
+		// host, and nothing anywhere reported it.
+		//
+		// The registrar holds the real per-agent certificate and this code already fetches the AK
+		// from it. The registrar stores BARE BASE64 DER while the verifier stores and requires PEM:
+		// sending it unwrapped yields "X509: NO_CERTIFICATE_OR_CRL_FOUND", and an unparseable value
+		// is UNRECOVERABLE -- the verifier cannot build an ssl_context, so it never polls the agent
+		// and can never complete a DELETE either, leaving the record deadlocked in TERMINATED.
+		mtlsCertContent := pemWrapCert(regResults.Results.MtlsCert)
+		if mtlsCertContent == "" {
+			// Fall back to the shared file rather than registering with no certificate, but be loud:
+			// this path means the agent inherits another host's identity.
+			certPath := "/etc/spire/keylime/auth-agent-cert.pem"
+			certBytes, ferr := ioutil.ReadFile(certPath)
+			if ferr != nil {
+				p.log.Warn("registrar returned no mtls_cert and the fallback file is unreadable; registering without a certificate",
+					"agent_uuid", agentID, "path", certPath, "error", ferr)
+				certBytes = []byte{}
+			} else {
+				p.log.Warn("registrar returned no mtls_cert; FALLING BACK to the shared file, which is NOT this agent's own certificate",
+					"agent_uuid", agentID, "path", certPath)
+			}
+			mtlsCertContent = string(certBytes)
+		} else {
+			p.log.Info("Using this agent's own mTLS certificate from the registrar",
+				"agent_uuid", agentID, "cert_bytes", len(mtlsCertContent))
+		}
+		p.log.Debug("Retrieved AK from registrar", "ak_length", len(akTpm))
+		// Create agent add request with minimal policy
+		// IMA Runtime Policy - Phase 2: Exclude-based policy (no allowlist)
+		imaPolicyJSON := `{
+  "meta": {
+    "version": 5,
+    "generator": 0
+  },
+  "release": 0,
+  "digests": {},
+  "excludes": [
+    "/var/",
+    "/tmp/",
+    "/home/",
+    "/proc/",
+    "/sys/",
+    "/dev/shm/",
+    "/run/",
+    "/dev/",
+    "/sys/firmware/"
+  ],
+  "keyrings": {},
+  "ima": {
+    "ignored_keyrings": [],
+    "log_hash_alg": "sha256",
+    "dm_policy": null
+  },
+  "ima-buf": {},
+  "verification-keys": ""
+}`
+		runtimePolicy := base64.StdEncoding.EncodeToString([]byte(imaPolicyJSON))
+
+		addRequest := KeylimeAgentAddRequest{
+			TpmPolicy:               `{"mask": "0x90"}`,
+			MetaData:                "{}",
+			MbRefstate:              "",
+			MbPolicy:                "",
+			MbPolicyName:            "",
+			ImaSignVerificationKeys: "[]",
+			RevocationKey:           "",
+			AcceptTpmHashAlgs:       "[\"sha256\", \"sha384\", \"sha512\"]",
+			AcceptTpmEncryptionAlgs: "[\"rsa\", \"rsa2048\", \"ecc\"]",
+			AcceptTpmSigningAlgs:    "[\"rsassa\", \"rsapss\", \"ecdsa\", \"ecdaa\", \"ecschnorr\"]",
+			AkTpm:                   akTpm,
+			RuntimePolicy:           runtimePolicy,
+			RuntimePolicyName:       "",
+			SupportedVersion:        "2.5",
+			MtlsCert:                mtlsCertContent,
+			CloudAgentIP:            regResults.Results.IP,
+			CloudAgentPort:          fmt.Sprintf("%d", regResults.Results.Port),
+		}
+		addBody, err := json.Marshal(addRequest)
+		if err != nil {
+			return status.Errorf(codes.Internal, "unable to marshal agent add request: %v", err)
+		}
+		p.log.Debug("Agent add request body", "json", string(addBody))
+
+		// POST to add agent to verifier
+		addUrl := keylimeStatusUrl
+		p.log.Debug("Adding agent to verifier", "url", addUrl)
+		addReq, err := http.NewRequest(http.MethodPost, addUrl, strings.NewReader(string(addBody)))
+		if err != nil {
+			return status.Errorf(codes.Internal, "unable to create add agent request: %v", err)
+		}
+		addReq.Header.Set("Content-Type", "application/json")
+
+		addRes, err := httpClient.Do(addReq)
+		if err != nil {
+			return status.Errorf(codes.Internal, "unable to add agent to verifier: %v", err)
+		}
+		p.log.Debug("Add agent response", "status", addRes.StatusCode)
+
+		if addRes.StatusCode != http.StatusOK && addRes.StatusCode != http.StatusCreated {
+			bodyBytes, _ := ioutil.ReadAll(addRes.Body)
+			return status.Errorf(codes.Internal, "failed to add agent to verifier, status %d: %s", addRes.StatusCode, string(bodyBytes))
+		}
+
+		p.log.Info("Successfully added agent to verifier", "agent_uuid", agentID)
+
+		// Re-check status after adding
+		statusReq, _ = http.NewRequest(http.MethodGet, keylimeStatusUrl, nil)
+		statusRes, err = httpClient.Do(statusReq)
+		if err != nil {
+			return status.Errorf(codes.Internal, "unable to check agent status after adding: %v", err)
+		}
+	}
+
 	var statusResults KeylimeVerifierStatusResponse
 	err = json.NewDecoder(statusRes.Body).Decode(&statusResults)
 	if err != nil {
@@ -138,10 +340,30 @@ func (p *Plugin) Attest(stream nodeattestorv1.NodeAttestor_AttestServer) error {
 	keylimeOpState := statusResults.Results.OperationalState
 	p.log.Debug("Keylime Verifier Status Results", "operational_state", keylimeOpState)
 
-	// TODO - make this more robust and less hard-coded
-	if keylimeOpState != 3 && keylimeOpState != 4 {
-		return status.Errorf(codes.Internal, "Keylime agent is not in a verified state. Current state: %d", keylimeOpState)
+	// Wait for agent to reach valid state with retry logic
+	// Valid states: 1 (Registered), 3 (Get Quote - verified), 4 (Provide V - verified)
+	maxRetries := 15
+	retryDelay := 2 * time.Second
+
+	for i := 0; i < maxRetries && (keylimeOpState != 1 && keylimeOpState != 3 && keylimeOpState != 4); i++ {
+		p.log.Debug("Agent not yet in valid state, waiting", "agent_uuid", agentID, "state", keylimeOpState, "retry", i+1)
+		time.Sleep(retryDelay)
+
+		// Re-check status
+		statusReq, _ = http.NewRequest(http.MethodGet, keylimeStatusUrl, nil)
+		statusRes, err = httpClient.Do(statusReq)
+		if err == nil {
+			json.NewDecoder(statusRes.Body).Decode(&statusResults)
+			keylimeOpState = statusResults.Results.OperationalState
+			p.log.Debug("Updated agent state", "operational_state", keylimeOpState)
+		}
 	}
+
+	// Final check after retries
+	if keylimeOpState != 1 && keylimeOpState != 3 && keylimeOpState != 4 {
+		return status.Errorf(codes.Internal, "Keylime agent is not in a valid state after %d retries. Current state: %d (expected: 1=Registered, 3=Get Quote, or 4=Provide V)", maxRetries, keylimeOpState)
+	}
+	p.log.Info("Agent in valid state", "agent_uuid", agentID, "state", keylimeOpState)
 
 	// Create a nonce for use in a quote
 	keylimeNonce, err := common_keylime.NewNonce()
@@ -215,7 +437,7 @@ func (p *Plugin) Attest(stream nodeattestorv1.NodeAttestor_AttestServer) error {
 	}
 
 	// Create SPIFFE ID and selectors
-	spiffeID, err := idutil.AgentID(p.conf.trustDomain, fmt.Sprintf("/%s/%s", common_keylime.PluginName, keylimeAgentData.AgentID))
+	spiffeID, err := common_keylime.AgentID(p.conf.trustDomain, fmt.Sprintf("/%s/%s", common_keylime.PluginName, keylimeAgentData.AgentID))
 	if err != nil {
 		return status.Errorf(codes.Internal, "failed to create agent ID: %v", err)
 	}
